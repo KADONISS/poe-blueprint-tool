@@ -1,5 +1,7 @@
 # PoE Blueprint Batch Planner
 
+Phiên bản hiện tại: **v0.1.0**
+
 Tool tự động quét inventory 12×5, chỉ Ctrl+click các ô có Blueprint vào Planning Table, gán Rogue
 cho các equipment, thử Confirm Plans tối đa hai lần và tiếp tục Blueprint kế tiếp.
 
@@ -43,6 +45,7 @@ trên xuống dưới:
 - Bật **Debug** để xem ảnh chụp, khung nhận dạng và danh sách kết quả.
 - **Tốc độ plan** hiển thị trực tiếp, ví dụ `1.2 giây` hoặc `3.2 giây`.
 - **Ngưỡng** điều chỉnh độ nhạy detector equipment.
+- **Nấc zoom mỗi vùng** điều chỉnh số lần cuộn chuột khi tool lần lượt quét lưới 3×2 trên Planning Table.
 - Cài đặt được lưu trong `settings.json` cạnh chương trình.
 
 ## Phím nóng

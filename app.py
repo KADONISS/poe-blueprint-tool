@@ -17,7 +17,8 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageGrab, ImageTk
 
 
-APP_TITLE = "PoE Blueprint Rogue Assigner"
+APP_VERSION = "0.1.0"
+APP_TITLE = f"PoE Blueprint Rogue Assigner v{APP_VERSION}"
 BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 ASSET_DIR = BUNDLE_DIR / "assets" / "equipment"
@@ -26,7 +27,8 @@ SETTINGS_PATH = APP_DIR / "settings.json"
 REFERENCE_HEIGHT = 1368
 DETECTION_SCALE = 0.72
 HOTKEY_CODES = {f"F{number}": 0x6F + number for number in range(1, 13)}
-MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP = 0x0002, 0x0004
+MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_WHEEL = 0x0002, 0x0004, 0x0800
+WHEEL_DELTA = 120
 KEYEVENTF_KEYUP = 0x0002
 VK_CONTROL = 0x11
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -283,6 +285,7 @@ class BlueprintAssigner:
         self.plan_speed = DoubleVar(value=1.6)
         self.speed_input = StringVar(value="1.6")
         self.threshold_input = StringVar(value="0.72")
+        self.zoom_steps_input = StringVar(value="3")
         self.debug_enabled = StringVar(value="0")
         self.run_hotkey = StringVar(value="F6")
         self.stop_hotkey = StringVar(value="F8")
@@ -300,6 +303,7 @@ class BlueprintAssigner:
         self.capture_origin = (0, 0)
         self.active_speed = 1.6
         self.active_threshold = 0.72
+        self.active_zoom_steps = 3
         self.stop_event = threading.Event()
         self.busy = False
         self._hotkeys_down: set[int] = set()
@@ -402,6 +406,22 @@ class BlueprintAssigner:
         self.threshold_entry.bind("<Return>", self._apply_threshold_input)
         self.threshold_entry.bind("<FocusOut>", self._apply_threshold_input)
 
+        zoom_row = Frame(self.settings_tab)
+        zoom_row.pack(fill="x", pady=(0, 12))
+        Label(zoom_row, text="Nấc zoom mỗi vùng:", width=15, anchor="w").pack(side=LEFT)
+        self.zoom_steps_entry = ttk.Spinbox(
+            zoom_row,
+            from_=1,
+            to=6,
+            textvariable=self.zoom_steps_input,
+            width=6,
+            justify="center",
+        )
+        self.zoom_steps_entry.pack(side=LEFT, padx=8)
+        self.zoom_steps_entry.bind("<Return>", self._apply_zoom_steps_input)
+        self.zoom_steps_entry.bind("<FocusOut>", self._apply_zoom_steps_input)
+        Label(zoom_row, text="nấc cuộn lên; tool cuộn xuống cùng số nấc sau mỗi vùng").pack(side=LEFT)
+
         hotkey_row = Frame(self.settings_tab)
         hotkey_row.pack(fill="x", pady=(0, 12))
         Label(hotkey_row, text="Hotkey chạy:", width=15, anchor="w").pack(side=LEFT)
@@ -454,12 +474,16 @@ class BlueprintAssigner:
             return
         speed = data.get("plan_speed", 1.6)
         threshold = data.get("threshold", 0.72)
+        zoom_steps = data.get("zoom_steps", 3)
         if isinstance(speed, (int, float)) and 0.5 <= float(speed) <= 5.0:
             self.plan_speed.set(round(float(speed), 1))
             self.speed_input.set(f"{float(speed):.1f}")
         if isinstance(threshold, (int, float)) and 0.58 <= float(threshold) <= 0.92:
             self.threshold.set(round(float(threshold), 2))
             self.threshold_input.set(f"{float(threshold):.2f}")
+        if isinstance(zoom_steps, int) and 1 <= zoom_steps <= 6:
+            self.zoom_steps_input.set(str(zoom_steps))
+            self.active_zoom_steps = zoom_steps
         run_key = str(data.get("run_hotkey", "F6")).upper()
         stop_key = str(data.get("stop_hotkey", "F8")).upper()
         if run_key in HOTKEY_CODES and stop_key in HOTKEY_CODES and run_key != stop_key:
@@ -473,9 +497,14 @@ class BlueprintAssigner:
             self.process_choice.set(data["process"])
 
     def _save_settings(self) -> None:
+        try:
+            zoom_steps = int(self.zoom_steps_input.get())
+        except ValueError:
+            zoom_steps = self.active_zoom_steps
         data = {
             "plan_speed": round(float(self.plan_speed.get()), 1),
             "threshold": round(float(self.threshold.get()), 2),
+            "zoom_steps": zoom_steps,
             "run_hotkey": self.run_hotkey.get(),
             "stop_hotkey": self.stop_hotkey.get(),
             "debug": self.debug_enabled.get(),
@@ -549,6 +578,19 @@ class BlueprintAssigner:
         self._save_settings()
         return True
 
+    def _apply_zoom_steps_input(self, _event: object = None) -> bool:
+        try:
+            value = int(self.zoom_steps_input.get().strip())
+            if not 1 <= value <= 6:
+                raise ValueError
+        except ValueError:
+            self.zoom_steps_input.set(str(self.active_zoom_steps))
+            self.status.set("Số nấc zoom phải là số nguyên trong khoảng 1–6.")
+            return False
+        self.zoom_steps_input.set(str(value))
+        self._save_settings()
+        return True
+
     def toggle_debug(self) -> None:
         if self.debug_enabled.get() == "1":
             self.body.pack(fill=BOTH, expand=True, pady=(8, 0))
@@ -593,7 +635,11 @@ class BlueprintAssigner:
     def start_run(self) -> None:
         if self.busy:
             return
-        if not self._apply_speed_input() or not self._apply_threshold_input():
+        if (
+            not self._apply_speed_input()
+            or not self._apply_threshold_input()
+            or not self._apply_zoom_steps_input()
+        ):
             return
         if not messagebox.askokcancel(
             APP_TITLE,
@@ -605,6 +651,7 @@ class BlueprintAssigner:
         self.stop_event.clear()
         self.active_speed = round(float(self.plan_speed.get()), 1)
         self.active_threshold = float(self.threshold.get())
+        self.active_zoom_steps = int(self.zoom_steps_input.get())
         threading.Thread(target=self._run_worker, daemon=True).start()
 
     @staticmethod
@@ -614,6 +661,17 @@ class BlueprintAssigner:
         ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
         time.sleep(0.025)
         ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+    @staticmethod
+    def _mouse_wheel_at(x: int, y: int, steps: int) -> None:
+        """Cuộn thật trong game tại một điểm; steps dương zoom vào, âm zoom ra."""
+        user32 = ctypes.windll.user32
+        user32.SetCursorPos(int(x), int(y))
+        time.sleep(0.06)
+        delta = WHEEL_DELTA if steps > 0 else -WHEEL_DELTA
+        for _ in range(abs(steps)):
+            user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
+            time.sleep(0.08)
 
     @classmethod
     def _ctrl_click(cls, x: int, y: int) -> None:
@@ -778,57 +836,120 @@ class BlueprintAssigner:
                 matches.append((index, best_score))
         return matches
 
-    def _plan_current_blueprint(self, blueprint_number: int) -> list[dict]:
-        """Module plan hiện tại: giữ detector thẻ + số 5, không chờ popup đóng."""
-        actions: list[dict] = []
-        initial = self.capture()
-        found = self.detector.scan(initial, self.active_threshold)
-        total_targets = min(len(found), 20)
-        for index, target in enumerate(found[:20], 1):
-            if self.stop_event.is_set():
-                break
-            item_started = time.perf_counter()
-            self._worker_status(
-                f"Blueprint {blueprint_number}: thẻ {index}/{total_targets} — {target.name}"
+    @staticmethod
+    def _planning_zoom_centers(width: int, height: int) -> list[tuple[int, int]]:
+        """Tâm lưới 3×2, đi theo cột để luôn ưu tiên từ trái sang phải."""
+        x0, x1 = width * 0.12, width * 0.89
+        y0, y1 = height * 0.07, height * 0.58
+        return [
+            (
+                round(x0 + (column + 0.5) * (x1 - x0) / 3),
+                round(y0 + (row + 0.5) * (y1 - y0) / 2),
             )
-            tx, ty = target.center
-            origin_x, origin_y = self.capture_origin
+            for column in range(3)
+            for row in range(2)
+        ]
+
+    def _assign_equipment_target(
+        self,
+        blueprint_number: int,
+        region_number: int,
+        index: int,
+        total_targets: int,
+        target: Detection,
+    ) -> dict:
+        item_started = time.perf_counter()
+        self._worker_status(
+            f"Blueprint {blueprint_number}: vùng {region_number}/6 · "
+            f"thẻ {index}/{total_targets} — {target.name}"
+        )
+        tx, ty = target.center
+        origin_x, origin_y = self.capture_origin
+        self._click(tx + origin_x, ty + origin_y)
+
+        popup, level_five = self._wait_for_level_five(0.45)
+        if popup is None or level_five is None:
             self._click(tx + origin_x, ty + origin_y)
+            popup, level_five = self._wait_for_level_five(0.35)
 
-            popup, level_five = self._wait_for_level_five(0.45)
-            if popup is None or level_five is None:
-                self._click(tx + origin_x, ty + origin_y)
-                popup, level_five = self._wait_for_level_five(0.35)
+        action = {
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "blueprint": blueprint_number,
+            "zoom_region": region_number,
+            "equipment": target.name,
+            "score": round(target.score, 4),
+            "equipment_point_game": [tx, ty],
+            "success": False,
+        }
+        if level_five is not None:
+            time.sleep(0.18)
+            stable = self._level_five_click_target(self.capture())
+            if stable is not None:
+                level_five = stable
+            rogue_x, rogue_y, level_five_score = level_five
+            origin_x, origin_y = self.capture_origin
+            self._click(rogue_x + origin_x, rogue_y + origin_y)
+            action.update({
+                "success": True,
+                "rogue_point_game": [rogue_x, rogue_y],
+                "level_five_score": round(level_five_score, 4),
+            })
+        else:
+            action["error"] = "Không tìm thấy số 5; tiếp tục thẻ kế tiếp."
 
-            action = {
-                "time": datetime.now().isoformat(timespec="seconds"),
-                "blueprint": blueprint_number,
-                "equipment": target.name,
-                "score": round(target.score, 4),
-                "equipment_point_game": [tx, ty],
-                "success": False,
-            }
-            if level_five is not None:
-                time.sleep(0.18)
-                stable = self._level_five_click_target(self.capture())
-                if stable is not None:
-                    level_five = stable
-                rogue_x, rogue_y, level_five_score = level_five
+        elapsed = time.perf_counter() - item_started
+        if elapsed < self.active_speed:
+            time.sleep(self.active_speed - elapsed)
+        action["duration_seconds"] = round(time.perf_counter() - item_started, 3)
+        return action
+
+    def _plan_current_blueprint(self, blueprint_number: int) -> list[dict]:
+        """Zoom thật lần lượt 6 vùng, quét và chọn thẻ trong từng góc nhìn."""
+        actions: list[dict] = []
+        overview = self.capture()
+        centers = self._planning_zoom_centers(overview.width, overview.height)
+
+        for region_number, (center_x, center_y) in enumerate(centers, 1):
+            if self.stop_event.is_set() or len(actions) >= 20:
+                break
+            origin_x, origin_y = self.capture_origin
+            self._worker_status(
+                f"Blueprint {blueprint_number}: zoom vùng {region_number}/6 "
+                f"({self.active_zoom_steps} nấc)"
+            )
+            self._mouse_wheel_at(
+                center_x + origin_x,
+                center_y + origin_y,
+                self.active_zoom_steps,
+            )
+            time.sleep(max(0.30, min(0.75, self.active_speed * 0.30)))
+            try:
+                zoomed = self.capture()
+                found = self.detector.scan(zoomed, self.active_threshold)
+                remaining = 20 - len(actions)
+                targets = found[:remaining]
+                for index, target in enumerate(targets, 1):
+                    if self.stop_event.is_set():
+                        break
+                    actions.append(
+                        self._assign_equipment_target(
+                            blueprint_number,
+                            region_number,
+                            index,
+                            len(targets),
+                            target,
+                        )
+                    )
+            finally:
+                # Luôn trả lại đúng mức zoom ban đầu trước khi sang vùng khác,
+                # kể cả khi người dùng nhấn hotkey dừng giữa vùng.
                 origin_x, origin_y = self.capture_origin
-                self._click(rogue_x + origin_x, rogue_y + origin_y)
-                action.update({
-                    "success": True,
-                    "rogue_point_game": [rogue_x, rogue_y],
-                    "level_five_score": round(level_five_score, 4),
-                })
-            else:
-                action["error"] = "Không tìm thấy số 5; tiếp tục thẻ kế tiếp."
-
-            elapsed = time.perf_counter() - item_started
-            if elapsed < self.active_speed:
-                time.sleep(self.active_speed - elapsed)
-            action["duration_seconds"] = round(time.perf_counter() - item_started, 3)
-            actions.append(action)
+                self._mouse_wheel_at(
+                    center_x + origin_x,
+                    center_y + origin_y,
+                    -self.active_zoom_steps,
+                )
+                time.sleep(max(0.25, min(0.60, self.active_speed * 0.20)))
         return actions
 
     def _confirm_twice_or_extract(self, blueprint_number: int) -> bool:
