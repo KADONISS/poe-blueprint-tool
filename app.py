@@ -16,8 +16,11 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageGrab, ImageTk
 
+cv2.setUseOptimized(True)
+cv2.setNumThreads(max(1, min(4, os.cpu_count() or 1)))
 
-APP_VERSION = "0.1.0"
+
+APP_VERSION = "0.2.0"
 APP_TITLE = f"PoE Blueprint Rogue Assigner v{APP_VERSION}"
 BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -25,7 +28,9 @@ ASSET_DIR = BUNDLE_DIR / "assets" / "equipment"
 LOG_DIR = APP_DIR / "logs"
 SETTINGS_PATH = APP_DIR / "settings.json"
 REFERENCE_HEIGHT = 1368
-DETECTION_SCALE = 0.72
+DETECTION_SCALE = 0.58
+TEMPLATE_SCALE_FACTORS = (0.62, 0.69, 0.82, 0.89, 0.95, 1.09, 1.15, 1.29, 1.42)
+PLANNING_ZOOM_FACTOR_PER_STEP = 1.135
 HOTKEY_CODES = {f"F{number}": 0x6F + number for number in range(1, 13)}
 MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_WHEEL = 0x0002, 0x0004, 0x0800
 WHEEL_DELTA = 120
@@ -36,7 +41,9 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 TEMPLATES = {
     "brute_force.png": "Brute Force",
     "counter_thaumaturgy.png": "Counter-Thaumaturgy",
+    "deception.png": "Deception",
     "perception_l1.png": "Perception L1",
+    "perception_l3.png": "Perception L3",
     "demolition.png": "Demolition",
     "engineering.png": "Engineering",
     "agility.png": "Agility",
@@ -185,7 +192,8 @@ class EquipmentDetector:
         base_scale = (height / REFERENCE_HEIGHT) * DETECTION_SCALE
         scaled: list[tuple[str, np.ndarray]] = []
         for name, original in self.templates:
-            for scale in base_scale * np.linspace(0.62, 1.42, 13):
+            for scale_factor in TEMPLATE_SCALE_FACTORS:
+                scale = base_scale * scale_factor
                 tw = max(9, round(original.shape[1] * float(scale)))
                 th = max(13, round(original.shape[0] * float(scale)))
                 template = cv2.resize(
@@ -205,6 +213,19 @@ class EquipmentDetector:
         intersection = max(0, ix2 - ix1) * max(0, iy2 - iy1)
         union = a.width * a.height + b.width * b.height - intersection
         return intersection / union if union else 0.0
+
+    @staticmethod
+    def _has_equipment_card_top_edge(gray: np.ndarray, detection: Detection) -> bool:
+        """Loại icon bản đồ rời bằng cạnh trên tương phản của thẻ giấy."""
+        x1, y1, x2, _y2 = detection.box
+        band = max(2, round(min(detection.width, detection.height) * 0.08))
+        if y1 < band or x1 < 0 or x2 > gray.shape[1]:
+            return False
+        inside = gray[y1:y1 + band, x1:x2].astype(np.float32)
+        outside = gray[y1 - band:y1, x1:x2].astype(np.float32)
+        if inside.shape != outside.shape or inside.size == 0:
+            return False
+        return float(np.mean(np.abs(inside - outside))) >= 10.0
 
     def scan(self, screenshot: Image.Image, threshold: float) -> list[Detection]:
         rgb = np.asarray(screenshot.convert("RGB"))
@@ -236,16 +257,16 @@ class EquipmentDetector:
             dilated = cv2.dilate(result, np.ones((7, 7), np.uint8))
             ys, xs = np.where((result >= threshold) & (result >= dilated - 1e-6))
             for px, py in zip(xs.tolist(), ys.tolist()):
-                candidates.append(
-                    Detection(
-                        name,
-                        float(result[py, px]),
-                        round(px / DETECTION_SCALE) + x0,
-                        round(py / DETECTION_SCALE) + y0,
-                        round(tw / DETECTION_SCALE),
-                        round(th / DETECTION_SCALE),
-                    )
+                candidate = Detection(
+                    name,
+                    float(result[py, px]),
+                    round(px / DETECTION_SCALE) + x0,
+                    round(py / DETECTION_SCALE) + y0,
+                    round(tw / DETECTION_SCALE),
+                    round(th / DETECTION_SCALE),
                 )
+                if self._has_equipment_card_top_edge(gray, candidate):
+                    candidates.append(candidate)
 
         # NMS dùng chung cho mọi template để một thẻ chỉ xuất hiện một lần.
         kept: list[Detection] = []
@@ -259,8 +280,8 @@ class BlueprintAssigner:
     def __init__(self, root: Tk) -> None:
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("780x340")
-        self.root.minsize(680, 300)
+        self.root.geometry("620x300")
+        self.root.minsize(480, 260)
         self.detector = EquipmentDetector()
         self.level_five_template = cv2.imread(
             str(BUNDLE_DIR / "assets" / "rogue_level_5.png"),
@@ -275,16 +296,22 @@ class BlueprintAssigner:
         if confirm_reference is None:
             raise FileNotFoundError("Không đọc được assets/confirm_plans_reference.png")
         self.confirm_template = confirm_reference[80:130, 15:215]
+        self.confirm_ready_template = cv2.imread(
+            str(BUNDLE_DIR / "assets" / "confirm_plans_ready.png"),
+            cv2.IMREAD_GRAYSCALE,
+        )
+        if self.confirm_ready_template is None:
+            raise FileNotFoundError("Không đọc được assets/confirm_plans_ready.png")
         self.inventory_blueprint_template = cv2.imread(
             str(BUNDLE_DIR / "assets" / "inventory_blueprint.png"),
             cv2.IMREAD_GRAYSCALE,
         )
         if self.inventory_blueprint_template is None:
             raise FileNotFoundError("Không đọc được assets/inventory_blueprint.png")
-        self.threshold = DoubleVar(value=0.72)
+        self.threshold = DoubleVar(value=0.68)
         self.plan_speed = DoubleVar(value=1.6)
         self.speed_input = StringVar(value="1.6")
-        self.threshold_input = StringVar(value="0.72")
+        self.threshold_input = StringVar(value="0.68")
         self.zoom_steps_input = StringVar(value="3")
         self.debug_enabled = StringVar(value="0")
         self.run_hotkey = StringVar(value="F6")
@@ -302,7 +329,7 @@ class BlueprintAssigner:
         self.process_choice = StringVar(value="")
         self.capture_origin = (0, 0)
         self.active_speed = 1.6
-        self.active_threshold = 0.72
+        self.active_threshold = 0.68
         self.active_zoom_steps = 3
         self.stop_event = threading.Event()
         self.busy = False
@@ -317,33 +344,34 @@ class BlueprintAssigner:
 
     def _build(self) -> None:
         self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill=BOTH, expand=True, padx=10, pady=(10, 4))
-        self.planning_tab = Frame(self.notebook, padx=12, pady=12)
-        self.reveal_tab = Frame(self.notebook, padx=18, pady=18)
-        self.settings_tab = Frame(self.notebook, padx=12, pady=12)
+        self.notebook.pack(fill=BOTH, expand=True, padx=6, pady=(6, 3))
+        self.planning_tab = Frame(self.notebook, padx=8, pady=8)
+        self.reveal_tab = Frame(self.notebook, padx=10, pady=10)
+        self.settings_tab = Frame(self.notebook, padx=8, pady=8)
         self.notebook.add(self.planning_tab, text="Planning Heist")
         self.notebook.add(self.reveal_tab, text="Reveal Room")
         self.notebook.add(self.settings_tab, text="Cài đặt")
 
         action_row = Frame(self.planning_tab)
         action_row.pack(fill="x")
-        self.run_button = Button(action_row, text="Batch Blueprint (F6)", width=21, command=self.start_run)
-        self.run_button.pack(side=LEFT, padx=(0, 8))
-        self.stop_button = Button(action_row, text="Dừng (F8)", width=14, command=self.stop)
+        self.run_button = Button(action_row, text="Batch Blueprint (F6)", width=19, command=self.start_run)
+        self.run_button.pack(side=LEFT, padx=(0, 6))
+        self.stop_button = Button(action_row, text="Dừng (F8)", width=11, command=self.stop)
         self.stop_button.pack(side=LEFT)
         Label(
             self.planning_tab,
             textvariable=self.summary,
             justify=LEFT,
             anchor="nw",
-            wraplength=720,
-        ).pack(fill="x", pady=(14, 6))
+            wraplength=560,
+        ).pack(fill="x", pady=(8, 4))
         Label(
             self.planning_tab,
             text="Mở Planning Table + Inventory, sau đó chạy batch. Tool chỉ Ctrl+click các ô được nhận dạng là Blueprint.",
             justify=LEFT,
             anchor="w",
             fg="#444",
+            wraplength=560,
         ).pack(fill="x")
 
         Label(
@@ -361,22 +389,22 @@ class BlueprintAssigner:
         ).pack(fill="x", pady=(12, 0))
 
         process_row = Frame(self.settings_tab)
-        process_row.pack(fill="x", pady=(0, 12))
-        Label(process_row, text="Process game:", width=15, anchor="w").pack(side=LEFT)
+        process_row.pack(fill="x", pady=(0, 8))
+        Label(process_row, text="Process game:", width=13, anchor="w").pack(side=LEFT)
         self.process_box = ttk.Combobox(process_row, textvariable=self.process_choice, state="readonly")
         self.process_box.pack(side=LEFT, fill="x", expand=True, padx=(0, 8))
         self.process_box.bind("<<ComboboxSelected>>", lambda _event: self._save_settings())
-        Button(process_row, text="Làm mới", width=11, command=self.refresh_processes).pack(side=RIGHT)
+        Button(process_row, text="Làm mới", width=8, command=self.refresh_processes).pack(side=RIGHT)
 
         settings_row = Frame(self.settings_tab)
-        settings_row.pack(fill="x", pady=(0, 12))
-        Label(settings_row, text="Tốc độ plan:", width=15, anchor="w").pack(side=LEFT)
+        settings_row.pack(fill="x", pady=(0, 8))
+        Label(settings_row, text="Tốc độ plan:", width=13, anchor="w").pack(side=LEFT)
         ttk.Scale(
             settings_row,
             from_=0.5,
             to=5.0,
             variable=self.plan_speed,
-            length=210,
+            length=150,
             command=self._speed_changed,
         ).pack(side=LEFT, padx=8)
         self.speed_entry = ttk.Entry(settings_row, textvariable=self.speed_input, width=6, justify="center")
@@ -386,14 +414,14 @@ class BlueprintAssigner:
         Label(settings_row, text="giây").pack(side=LEFT, padx=(4, 0))
 
         threshold_row = Frame(self.settings_tab)
-        threshold_row.pack(fill="x", pady=(0, 12))
-        Label(threshold_row, text="Ngưỡng:", width=15, anchor="w").pack(side=LEFT)
+        threshold_row.pack(fill="x", pady=(0, 8))
+        Label(threshold_row, text="Ngưỡng:", width=13, anchor="w").pack(side=LEFT)
         ttk.Scale(
             threshold_row,
             from_=0.58,
             to=0.92,
             variable=self.threshold,
-            length=210,
+            length=150,
             command=self._threshold_changed,
         ).pack(side=LEFT, padx=8)
         self.threshold_entry = ttk.Entry(
@@ -407,8 +435,8 @@ class BlueprintAssigner:
         self.threshold_entry.bind("<FocusOut>", self._apply_threshold_input)
 
         zoom_row = Frame(self.settings_tab)
-        zoom_row.pack(fill="x", pady=(0, 12))
-        Label(zoom_row, text="Nấc zoom mỗi vùng:", width=15, anchor="w").pack(side=LEFT)
+        zoom_row.pack(fill="x", pady=(0, 8))
+        Label(zoom_row, text="Nấc zoom:", width=13, anchor="w").pack(side=LEFT)
         self.zoom_steps_entry = ttk.Spinbox(
             zoom_row,
             from_=1,
@@ -420,11 +448,11 @@ class BlueprintAssigner:
         self.zoom_steps_entry.pack(side=LEFT, padx=8)
         self.zoom_steps_entry.bind("<Return>", self._apply_zoom_steps_input)
         self.zoom_steps_entry.bind("<FocusOut>", self._apply_zoom_steps_input)
-        Label(zoom_row, text="nấc cuộn lên; tool cuộn xuống cùng số nấc sau mỗi vùng").pack(side=LEFT)
+        Label(zoom_row, text="cuộn lên/xuống mỗi vùng").pack(side=LEFT)
 
         hotkey_row = Frame(self.settings_tab)
-        hotkey_row.pack(fill="x", pady=(0, 12))
-        Label(hotkey_row, text="Hotkey chạy:", width=15, anchor="w").pack(side=LEFT)
+        hotkey_row.pack(fill="x", pady=(0, 8))
+        Label(hotkey_row, text="Hotkey chạy:", width=13, anchor="w").pack(side=LEFT)
         self.run_hotkey_box = ttk.Combobox(
             hotkey_row,
             textvariable=self.run_hotkey,
@@ -447,7 +475,7 @@ class BlueprintAssigner:
 
         Checkbutton(
             self.settings_tab,
-            text="Hiển thị màn hình Debug trong tab Planning Heist",
+            text="Hiện Debug trong tab Planning Heist",
             variable=self.debug_enabled,
             onvalue="1",
             offvalue="0",
@@ -459,11 +487,11 @@ class BlueprintAssigner:
         self.canvas.pack(side=LEFT, fill=BOTH, expand=True)
         self.canvas.bind("<Configure>", lambda _event: self.render())
 
-        panel = Frame(self.body, width=280, padx=14, pady=8)
+        panel = Frame(self.body, width=220, padx=10, pady=6)
         panel.pack(side=RIGHT, fill="y")
         panel.pack_propagate(False)
         Label(panel, text="KẾT QUẢ", font=("Segoe UI", 14, "bold"), anchor="w").pack(fill="x")
-        Label(panel, textvariable=self.summary, justify=LEFT, anchor="nw", wraplength=255).pack(fill=BOTH, expand=True, pady=12)
+        Label(panel, textvariable=self.summary, justify=LEFT, anchor="nw", wraplength=200).pack(fill=BOTH, expand=True, pady=8)
         self.status_label = Label(self.root, textvariable=self.status, anchor="w", padx=12, pady=8, relief="sunken")
         self.status_label.pack(fill="x")
 
@@ -473,7 +501,7 @@ class BlueprintAssigner:
         except (OSError, ValueError, TypeError):
             return
         speed = data.get("plan_speed", 1.6)
-        threshold = data.get("threshold", 0.72)
+        threshold = data.get("threshold", 0.68)
         zoom_steps = data.get("zoom_steps", 3)
         if isinstance(speed, (int, float)) and 0.5 <= float(speed) <= 5.0:
             self.plan_speed.set(round(float(speed), 1))
@@ -594,13 +622,15 @@ class BlueprintAssigner:
     def toggle_debug(self) -> None:
         if self.debug_enabled.get() == "1":
             self.body.pack(fill=BOTH, expand=True, pady=(8, 0))
-            self.root.geometry("1180x780")
-            self.root.minsize(900, 620)
+            width = min(1040, max(640, self.root.winfo_screenwidth() - 80))
+            height = min(720, max(460, self.root.winfo_screenheight() - 120))
+            self.root.geometry(f"{width}x{height}")
+            self.root.minsize(560, 420)
             self.render()
         else:
             self.body.pack_forget()
-            self.root.minsize(680, 300)
-            self.root.geometry("780x340")
+            self.root.minsize(480, 260)
+            self.root.geometry("620x300")
         self._save_settings()
 
     def refresh_processes(self) -> None:
@@ -641,12 +671,6 @@ class BlueprintAssigner:
             or not self._apply_zoom_steps_input()
         ):
             return
-        if not messagebox.askokcancel(
-            APP_TITLE,
-            "Mở Planning Table và Inventory trước khi chạy. Tool sẽ quét 60 ô và chỉ "
-            f"Ctrl+click các ô có Blueprint. {self.stop_hotkey.get()} để dừng.",
-        ):
-            return
         self.busy = True
         self.stop_event.clear()
         self.active_speed = round(float(self.plan_speed.get()), 1)
@@ -667,11 +691,11 @@ class BlueprintAssigner:
         """Cuộn thật trong game tại một điểm; steps dương zoom vào, âm zoom ra."""
         user32 = ctypes.windll.user32
         user32.SetCursorPos(int(x), int(y))
-        time.sleep(0.06)
+        time.sleep(0.03)
         delta = WHEEL_DELTA if steps > 0 else -WHEEL_DELTA
         for _ in range(abs(steps)):
             user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
-            time.sleep(0.08)
+            time.sleep(0.04)
 
     @classmethod
     def _ctrl_click(cls, x: int, y: int) -> None:
@@ -736,15 +760,132 @@ class BlueprintAssigner:
         badge_x, badge_y = best_center
         return badge_x, badge_y - round(height * 0.065), best_score
 
-    def _wait_for_level_five(self, timeout: float) -> tuple[Image.Image | None, tuple[int, int, float] | None]:
+    @staticmethod
+    def _first_rogue_card_target(image: Image.Image) -> tuple[int, int] | None:
+        """Tìm tâm portrait Rogue đầu tiên bên trái khi template số 5 không ổn định."""
+        gray = cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2GRAY)
+        height, width = gray.shape
+        edges = cv2.Canny(gray, 40, 120)
+        contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        cards: list[tuple[int, int, int, int]] = []
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            if (
+                width * 0.36 < x < width * 0.66
+                and height * 0.32 < y < height * 0.50
+                and width * 0.045 < w < width * 0.085
+                and height * 0.12 < h < height * 0.19
+            ):
+                cards.append((x, y, w, h))
+        if not cards:
+            return None
+
+        # Canny thường tạo 2–3 contour lồng nhau cho cùng một card. Gom theo
+        # tâm X và giữ contour lớn nhất để lấy tọa độ portrait ổn định.
+        groups: list[list[tuple[int, int, int, int]]] = []
+        for card in sorted(cards, key=lambda item: item[0] + item[2] / 2):
+            center_x = card[0] + card[2] / 2
+            group = next(
+                (
+                    existing
+                    for existing in groups
+                    if abs(center_x - (existing[0][0] + existing[0][2] / 2)) < width * 0.018
+                ),
+                None,
+            )
+            if group is None:
+                groups.append([card])
+            else:
+                group.append(card)
+        # Popup luôn có ít nhất hai Rogue. Một contour đơn lẻ thường là phòng/ô
+        # trên bản đồ Planning, không được phép dùng làm điểm click.
+        if len(groups) < 2:
+            return None
+        leftmost = min(
+            (max(group, key=lambda item: item[2] * item[3]) for group in groups),
+            key=lambda item: item[0] + item[2] / 2,
+        )
+        x, y, w, h = leftmost
+        return x + w // 2, y + round(h * 0.45)
+
+    def _rogue_choice_target(
+        self,
+        image: Image.Image,
+    ) -> tuple[int, int, float | None, str] | None:
+        # Khung card Rogue là dấu hiệu popup đáng tin cậy hơn đường viền panel:
+        # đường viền của bản đồ Planning đôi khi có hình học tương tự panel popup.
+        first_card = self._first_rogue_card_target(image)
+        if first_card is None:
+            return None
+        level_five = self._level_five_click_target(image)
+        if level_five is not None:
+            return level_five[0], level_five[1], level_five[2], "level_5"
+        return first_card[0], first_card[1], None, "leftmost_card"
+
+    def _popup_present(self, image: Image.Image) -> bool:
+        # Không dùng riêng detector panel ở đây: nó có false-positive trên chính
+        # giao diện Planning và khiến tool tưởng popup chưa đóng sau khi chọn Rogue.
+        return self._first_rogue_card_target(image) is not None
+
+    def _wait_for_rogue_choice(
+        self,
+        timeout: float,
+    ) -> tuple[tuple[int, int, float | None, str] | None, bool]:
         deadline = time.perf_counter() + timeout
+        popup_seen = False
         while time.perf_counter() < deadline and not self.stop_event.is_set():
             image = self.capture()
-            target = self._level_five_click_target(image)
-            if target is not None and self._popup_panel_visible(image):
-                return image, target
-            time.sleep(0.025)
-        return None, None
+            popup_seen = popup_seen or self._popup_present(image)
+            target = self._rogue_choice_target(image)
+            if target is not None:
+                return target, True
+            time.sleep(0.035)
+        return None, popup_seen
+
+    def _wait_for_popup_closed(self, timeout: float) -> bool:
+        deadline = time.perf_counter() + timeout
+        consecutive_closed = 0
+        while time.perf_counter() < deadline and not self.stop_event.is_set():
+            if self._popup_present(self.capture()):
+                consecutive_closed = 0
+            else:
+                consecutive_closed += 1
+                if consecutive_closed >= 3:
+                    return True
+            time.sleep(0.04)
+        return False
+
+    def _select_open_rogue_popup(
+        self,
+        initial_target: tuple[int, int, float | None, str] | None,
+    ) -> tuple[bool, tuple[int, int, float | None, str] | None, int]:
+        """Chỉ retry Rogue và xác nhận popup đóng; không bao giờ click lại equipment."""
+        deadline = time.perf_counter() + max(2.5, min(5.0, self.active_speed * 2.5))
+        target = initial_target
+        attempts = 0
+        y_offsets = (0.0, -0.012, 0.012, 0.0, -0.02, 0.02)
+        last_target = target
+
+        while attempts < len(y_offsets) and time.perf_counter() < deadline and not self.stop_event.is_set():
+            if target is None:
+                target, popup_seen = self._wait_for_rogue_choice(0.45)
+                if target is None:
+                    if not popup_seen:
+                        return True, last_target, attempts
+                    continue
+            rogue_x, rogue_y, score, method = target
+            image = self.capture()
+            adjusted_y = rogue_y + round(image.height * y_offsets[attempts])
+            origin_x, origin_y = self.capture_origin
+            self._click(rogue_x + origin_x, adjusted_y + origin_y)
+            attempts += 1
+            last_target = (rogue_x, adjusted_y, score, method)
+            close_timeout = max(1.0, min(1.8, self.active_speed * 1.5))
+            if self._wait_for_popup_closed(close_timeout):
+                return True, last_target, attempts
+            target = self._rogue_choice_target(self.capture())
+
+        return False, last_target, attempts
 
     def _focus_selected_game(self) -> None:
         target = self.selected_target()
@@ -795,12 +936,75 @@ class BlueprintAssigner:
             time.sleep(0.035)
         return None, None
 
+    def _find_ready_confirm_plans(self, image: Image.Image) -> tuple[int, int, float] | None:
+        """Chỉ nhận nút Confirm đang sáng, không dùng thay detector Planning Table."""
+        # Không bao giờ chuyển sang Confirm khi popup chọn Rogue còn che bản đồ.
+        if self._popup_present(image):
+            return None
+        rgb = np.asarray(image.convert("RGB"))
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        height, width = gray.shape
+        x0, x1 = int(width * 0.28), int(width * 0.72)
+        y0, y1 = int(height * 0.78), int(height * 0.98)
+        roi = gray[y0:y1, x0:x1]
+        best_score = -1.0
+        best_box: tuple[int, int, int, int] | None = None
+
+        for scale in (height / 1080.0) * np.linspace(0.75, 1.35, 25):
+            template = cv2.resize(
+                self.confirm_ready_template,
+                None,
+                fx=float(scale),
+                fy=float(scale),
+                interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC,
+            )
+            template_height, template_width = template.shape
+            if template_height >= roi.shape[0] or template_width >= roi.shape[1]:
+                continue
+            result = cv2.matchTemplate(roi, template, cv2.TM_CCOEFF_NORMED)
+            _minimum, maximum, _min_location, location = cv2.minMaxLoc(result)
+            if maximum > best_score:
+                best_score = float(maximum)
+                best_box = (
+                    x0 + location[0],
+                    y0 + location[1],
+                    template_width,
+                    template_height,
+                )
+
+        if best_box is None or best_score < 0.80:
+            return None
+
+        button_x, button_y, button_width, button_height = best_box
+        # Nút sẵn sàng có dải đỏ sáng rõ ở nửa dưới. Kiểm tra màu giúp phân
+        # biệt với nút tối dù chữ và khung của hai trạng thái gần giống nhau.
+        lower_half = rgb[
+            button_y + button_height // 2:button_y + button_height,
+            button_x:button_x + button_width,
+        ]
+        if lower_half.size == 0:
+            return None
+        red = lower_half[:, :, 0].astype(np.float32)
+        green = lower_half[:, :, 1].astype(np.float32)
+        blue = lower_half[:, :, 2].astype(np.float32)
+        red_glow = (red > 90) & (red > green * 1.25) & (red > blue * 1.15)
+        if float(np.mean(red_glow)) < 0.025:
+            return None
+
+        return (
+            button_x + button_width // 2,
+            button_y + button_height // 2,
+            best_score,
+        )
+
     @staticmethod
     def _inventory_slot_point(width: int, height: int, index: int) -> tuple[int, int]:
         row, column = divmod(index, 12)
-        # Inventory 12×5 trong vùng client 1920×1080, chuẩn hóa để hỗ trợ
-        # các độ phân giải khác: grid x=66.2–99.3%, y=54.3–78.8%.
-        x = width * (0.662 + (column + 0.5) * 0.0276)
+        # Grid inventory có kích thước theo chiều cao UI và neo vào cạnh phải.
+        # Công thức này giữ đúng cả client 1920×1080 lẫn 800×600.
+        cell_size = height * 0.0490
+        right_margin = height * 0.0367
+        x = width - right_margin - (11 - column) * cell_size
         y = height * (0.543 + (row + 0.5) * 0.0490)
         return round(x), round(y)
 
@@ -808,7 +1012,7 @@ class BlueprintAssigner:
         """Quét lưới 12×5 và trả về (slot index, confidence) của Blueprint."""
         gray = cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2GRAY)
         height, width = gray.shape
-        half_cell_width = round(width * 0.0140)
+        half_cell_width = round(height * 0.0245)
         half_cell_height = round(height * 0.0245)
         base_scale = height / 1080.0
         matches: list[tuple[int, float]] = []
@@ -838,17 +1042,48 @@ class BlueprintAssigner:
 
     @staticmethod
     def _planning_zoom_centers(width: int, height: int) -> list[tuple[int, int]]:
-        """Tâm lưới 3×2, đi theo cột để luôn ưu tiên từ trái sang phải."""
-        x0, x1 = width * 0.12, width * 0.89
-        y0, y1 = height * 0.07, height * 0.58
+        """Tâm lưới 3×3, đi theo cột để luôn ưu tiên từ trái sang phải."""
+        left_x = max(width * 0.20, height * 0.34)
+        right_x = min(width * 0.80, width - height * 0.25)
+        x_positions = (left_x, width * 0.50, right_x)
+        y_positions = (height * 0.12, height * 0.36, height * 0.60)
         return [
-            (
-                round(x0 + (column + 0.5) * (x1 - x0) / 3),
-                round(y0 + (row + 0.5) * (y1 - y0) / 2),
-            )
-            for column in range(3)
-            for row in range(2)
+            (round(x), round(y))
+            for x in x_positions
+            for y in y_positions
         ]
+
+    def _overview_equipment_point(
+        self,
+        zoom_center: tuple[int, int],
+        target: Detection,
+    ) -> tuple[float, float]:
+        """Quy đổi tâm thẻ trong ảnh zoom về tọa độ Planning Table trước khi zoom."""
+        scale = PLANNING_ZOOM_FACTOR_PER_STEP ** self.active_zoom_steps
+        center_x, center_y = zoom_center
+        target_x, target_y = target.center
+        return (
+            center_x + (target_x - center_x) / scale,
+            center_y + (target_y - center_y) / scale,
+        )
+
+    @staticmethod
+    def _equipment_point_already_processed(
+        point: tuple[float, float],
+        processed_points: list[tuple[float, float]],
+        width: int,
+        height: int,
+    ) -> bool:
+        # Sai số sau phép cuộn/hoàn nguyên chỉ vài pixel. Giới hạn này nhỏ hơn
+        # khoảng cách giữa hai thẻ liền nhau nên không làm mất thẻ thật.
+        tolerance_x = width * 0.012
+        tolerance_y = height * 0.018
+        return any(
+            ((point[0] - old_x) / tolerance_x) ** 2
+            + ((point[1] - old_y) / tolerance_y) ** 2
+            <= 1.0
+            for old_x, old_y in processed_points
+        )
 
     def _assign_equipment_target(
         self,
@@ -857,20 +1092,36 @@ class BlueprintAssigner:
         index: int,
         total_targets: int,
         target: Detection,
-    ) -> dict:
+    ) -> tuple[dict, bool, tuple[int, int, float] | None]:
         item_started = time.perf_counter()
         self._worker_status(
-            f"Blueprint {blueprint_number}: vùng {region_number}/6 · "
+            f"Blueprint {blueprint_number}: vùng {region_number}/9 · "
             f"thẻ {index}/{total_targets} — {target.name}"
         )
         tx, ty = target.center
         origin_x, origin_y = self.capture_origin
         self._click(tx + origin_x, ty + origin_y)
 
-        popup, level_five = self._wait_for_level_five(0.45)
-        if popup is None or level_five is None:
+        equipment_clicks = 1
+        popup_wait = max(1.25, min(2.20, self.active_speed))
+        rogue_target, popup_seen = self._wait_for_rogue_choice(popup_wait)
+        # Chỉ click equipment lần hai khi chắc chắn popup chưa từng xuất hiện.
+        # Nếu popup đã mở nhưng detector đang chuyển frame, chỉ tiếp tục chờ.
+        if rogue_target is None and not popup_seen:
             self._click(tx + origin_x, ty + origin_y)
-            popup, level_five = self._wait_for_level_five(0.35)
+            equipment_clicks += 1
+            rogue_target, popup_seen = self._wait_for_rogue_choice(popup_wait)
+        elif rogue_target is None:
+            rogue_target, popup_seen_late = self._wait_for_rogue_choice(0.90)
+            popup_seen = popup_seen or popup_seen_late
+
+        rogue_selected = False
+        selection_attempts = 0
+        selected_target: tuple[int, int, float | None, str] | None = None
+        if rogue_target is not None or popup_seen:
+            rogue_selected, selected_target, selection_attempts = self._select_open_rogue_popup(
+                rogue_target
+            )
 
         action = {
             "time": datetime.now().isoformat(timespec="seconds"),
@@ -879,42 +1130,53 @@ class BlueprintAssigner:
             "equipment": target.name,
             "score": round(target.score, 4),
             "equipment_point_game": [tx, ty],
-            "success": False,
+            "equipment_clicks": equipment_clicks,
+            "rogue_selection_attempts": selection_attempts,
+            "success": rogue_selected,
         }
-        if level_five is not None:
-            time.sleep(0.18)
-            stable = self._level_five_click_target(self.capture())
-            if stable is not None:
-                level_five = stable
-            rogue_x, rogue_y, level_five_score = level_five
-            origin_x, origin_y = self.capture_origin
-            self._click(rogue_x + origin_x, rogue_y + origin_y)
-            action.update({
-                "success": True,
-                "rogue_point_game": [rogue_x, rogue_y],
-                "level_five_score": round(level_five_score, 4),
-            })
+        if rogue_selected and selected_target is not None:
+            rogue_x, rogue_y, level_five_score, selection_method = selected_target
+            action["rogue_point_game"] = [rogue_x, rogue_y]
+            action["rogue_selection_method"] = selection_method
+            if level_five_score is not None:
+                action["level_five_score"] = round(level_five_score, 4)
+        elif not popup_seen:
+            action["error"] = "Equipment không mở popup Rogue sau 2 lần click."
         else:
-            action["error"] = "Không tìm thấy số 5; tiếp tục thẻ kế tiếp."
+            action["error"] = (
+                "Popup Rogue vẫn còn mở sau các lần retry; không click thẻ khác để tránh lệch."
+            )
 
         elapsed = time.perf_counter() - item_started
         if elapsed < self.active_speed:
             time.sleep(self.active_speed - elapsed)
         action["duration_seconds"] = round(time.perf_counter() - item_started, 3)
-        return action
+        final_image = self.capture()
+        popup_clear = not self._popup_present(final_image)
+        confirm_ready = self._find_ready_confirm_plans(final_image) if popup_clear else None
+        return action, popup_clear, confirm_ready
 
     def _plan_current_blueprint(self, blueprint_number: int) -> list[dict]:
-        """Zoom thật lần lượt 6 vùng, quét và chọn thẻ trong từng góc nhìn."""
+        """Zoom thật lần lượt 9 vùng, quét và chọn thẻ trong từng góc nhìn."""
         actions: list[dict] = []
         overview = self.capture()
         centers = self._planning_zoom_centers(overview.width, overview.height)
+        popup_blocked = False
+        ready = self._find_ready_confirm_plans(overview)
+        confirm_ready = ready is not None
+        processed_points: list[tuple[float, float]] = []
+        if confirm_ready:
+            self._worker_status(
+                f"Blueprint {blueprint_number}: Confirm Plans đã sáng; bỏ qua quét 9 vùng."
+            )
+            return actions
 
         for region_number, (center_x, center_y) in enumerate(centers, 1):
             if self.stop_event.is_set() or len(actions) >= 20:
                 break
             origin_x, origin_y = self.capture_origin
             self._worker_status(
-                f"Blueprint {blueprint_number}: zoom vùng {region_number}/6 "
+                f"Blueprint {blueprint_number}: zoom vùng {region_number}/9 "
                 f"({self.active_zoom_steps} nấc)"
             )
             self._mouse_wheel_at(
@@ -922,24 +1184,57 @@ class BlueprintAssigner:
                 center_y + origin_y,
                 self.active_zoom_steps,
             )
-            time.sleep(max(0.30, min(0.75, self.active_speed * 0.30)))
+            time.sleep(max(0.16, min(0.40, self.active_speed * 0.18)))
             try:
                 zoomed = self.capture()
                 found = self.detector.scan(zoomed, self.active_threshold)
                 remaining = 20 - len(actions)
-                targets = found[:remaining]
-                for index, target in enumerate(targets, 1):
+                targets: list[tuple[Detection, tuple[float, float]]] = []
+                for target in found:
+                    overview_point = self._overview_equipment_point(
+                        (center_x, center_y),
+                        target,
+                    )
+                    if self._equipment_point_already_processed(
+                        overview_point,
+                        processed_points,
+                        overview.width,
+                        overview.height,
+                    ):
+                        continue
+                    targets.append((target, overview_point))
+                    if len(targets) >= remaining:
+                        break
+
+                for index, (target, overview_point) in enumerate(targets, 1):
                     if self.stop_event.is_set():
                         break
-                    actions.append(
-                        self._assign_equipment_target(
-                            blueprint_number,
-                            region_number,
-                            index,
-                            len(targets),
-                            target,
-                        )
+                    action, popup_clear, ready = self._assign_equipment_target(
+                        blueprint_number,
+                        region_number,
+                        index,
+                        len(targets),
+                        target,
                     )
+                    action["overview_point_game"] = [
+                        round(overview_point[0], 1),
+                        round(overview_point[1], 1),
+                    ]
+                    actions.append(action)
+                    if action.get("success"):
+                        processed_points.append(overview_point)
+                    if not popup_clear:
+                        popup_blocked = True
+                        break
+                    if ready is not None:
+                        action["confirm_ready"] = True
+                        action["confirm_ready_score"] = round(ready[2], 4)
+                        confirm_ready = True
+                        self._worker_status(
+                            f"Blueprint {blueprint_number}: Confirm Plans đã sáng; "
+                            "dừng tìm thẻ để xác nhận."
+                        )
+                        break
             finally:
                 # Luôn trả lại đúng mức zoom ban đầu trước khi sang vùng khác,
                 # kể cả khi người dùng nhấn hotkey dừng giữa vùng.
@@ -949,7 +1244,9 @@ class BlueprintAssigner:
                     center_y + origin_y,
                     -self.active_zoom_steps,
                 )
-                time.sleep(max(0.25, min(0.60, self.active_speed * 0.20)))
+                time.sleep(max(0.12, min(0.30, self.active_speed * 0.12)))
+            if popup_blocked or confirm_ready:
+                break
         return actions
 
     def _confirm_twice_or_extract(self, blueprint_number: int) -> bool:
