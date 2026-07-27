@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -20,7 +21,7 @@ cv2.setUseOptimized(True)
 cv2.setNumThreads(max(1, min(4, os.cpu_count() or 1)))
 
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.1"
 APP_TITLE = f"PoE Blueprint Rogue Assigner v{APP_VERSION}"
 BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -31,12 +32,19 @@ REFERENCE_HEIGHT = 1368
 DETECTION_SCALE = 0.58
 TEMPLATE_SCALE_FACTORS = (0.62, 0.69, 0.82, 0.89, 0.95, 1.09, 1.15, 1.29, 1.42)
 PLANNING_ZOOM_FACTOR_PER_STEP = 1.135
+PLANNED_BLUEPRINT_THRESHOLD = 0.70
 HOTKEY_CODES = {f"F{number}": 0x6F + number for number in range(1, 13)}
 MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_WHEEL = 0x0002, 0x0004, 0x0800
 WHEEL_DELTA = 120
 KEYEVENTF_KEYUP = 0x0002
 VK_CONTROL = 0x11
+VK_C = 0x43
+CF_UNICODETEXT = 13
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+WINGS_REVEALED_PATTERN = re.compile(
+    r"Wings\s+Revealed\s*:\s*(\d+)\s*/\s*(\d+)",
+    re.IGNORECASE,
+)
 
 TEMPLATES = {
     "brute_force.png": "Brute Force",
@@ -164,6 +172,17 @@ class Detection:
         return self.x, self.y, self.x + self.width, self.y + self.height
 
 
+@dataclass
+class InventoryBlueprintDetection:
+    slot_index: int
+    blueprint_score: float
+    planned_score: float
+
+    @property
+    def is_planned(self) -> bool:
+        return self.planned_score >= PLANNED_BLUEPRINT_THRESHOLD
+
+
 class EquipmentDetector:
     def __init__(self) -> None:
         self.templates: list[tuple[str, np.ndarray]] = []
@@ -181,7 +200,15 @@ class EquipmentDetector:
                 normalized_width = 43
                 normalized_height = round(image.shape[0] * normalized_width / image.shape[1])
                 image = cv2.resize(image, (normalized_width, normalized_height), interpolation=cv2.INTER_AREA)
-            # Viền và chữ ít ổn định hơn biểu tượng; gradient giúp chống đổi sáng.
+            else:
+                # Giữ kích thước toàn bộ card để tránh icon/phòng nhỏ trên bản đồ,
+                # nhưng đưa vùng Level 1–5 + tên nghề về màu trung bình của phần
+                # icon. Với CCOEFF, vùng phẳng gần như không đóng góp vào tử số:
+                # detector học hình nghề mà vẫn yêu cầu footprint của một card đủ.
+                icon_end = max(13, round(image.shape[0] * 0.70))
+                icon_mean = int(round(float(np.mean(image[:icon_end, :]))))
+                image[icon_end:, :] = icon_mean
+            # Làm nhẹ nhiễu giấy/nhấp nháy trước khi template-match biểu tượng.
             image = cv2.GaussianBlur(image, (3, 3), 0)
             self.templates.append((name, image))
 
@@ -227,6 +254,30 @@ class EquipmentDetector:
             return False
         return float(np.mean(np.abs(inside - outside))) >= 10.0
 
+    @staticmethod
+    def _has_equipment_card_paper(gray: np.ndarray, detection: Detection) -> bool:
+        """Phân biệt nền giấy sáng của card với phòng/icon trực tiếp trên bản đồ."""
+        x1, y1, x2, y2 = detection.box
+        if x1 < 0 or y1 < 0 or x2 > gray.shape[1] or y2 > gray.shape[0]:
+            return False
+        patch = gray[y1:y2, x1:x2]
+        if patch.size == 0:
+            return False
+        side_band = max(2, round(patch.shape[1] * 0.09))
+        inner = patch[:, side_band:-side_band]
+        if inner.size == 0:
+            return False
+        inner_mean = float(np.mean(inner))
+        darkest_side = min(
+            float(np.mean(patch[:, :side_band])),
+            float(np.mean(patch[:, -side_band:])),
+        )
+        return (
+            float(np.mean(patch > 135)) >= 0.32
+            and float(np.mean(patch)) >= 118
+            and darkest_side <= inner_mean - 8
+        )
+
     def scan(self, screenshot: Image.Image, threshold: float) -> list[Detection]:
         rgb = np.asarray(screenshot.convert("RGB"))
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
@@ -236,7 +287,9 @@ class EquipmentDetector:
         x0, x1 = int(width * 0.12), int(width * 0.89)
         # Equipment của Blueprint chỉ xuất hiện ở phần trên của bản đồ. Bỏ vùng
         # HUD/phòng phía dưới giúp giảm khoảng 22% số pixel phải template-match.
-        y0, y1 = int(height * 0.07), int(height * 0.58)
+        # Một số hàng card ở cửa sổ 1768×992/1680×1050 nằm sát mốc 58%;
+        # giữ tới 62% để footprint đầy đủ không bị cắt mất phần dưới.
+        y0, y1 = int(height * 0.07), int(height * 0.62)
         roi = cv2.GaussianBlur(gray[y0:y1, x0:x1], (3, 3), 0)
         roi = cv2.resize(
             roi,
@@ -265,7 +318,10 @@ class EquipmentDetector:
                     round(tw / DETECTION_SCALE),
                     round(th / DETECTION_SCALE),
                 )
-                if self._has_equipment_card_top_edge(gray, candidate):
+                if (
+                    self._has_equipment_card_top_edge(gray, candidate)
+                    and self._has_equipment_card_paper(gray, candidate)
+                ):
                     candidates.append(candidate)
 
         # NMS dùng chung cho mọi template để một thẻ chỉ xuất hiện một lần.
@@ -273,7 +329,17 @@ class EquipmentDetector:
         for candidate in sorted(candidates, key=lambda item: item.score, reverse=True):
             if all(self._iou(candidate, existing) < 0.32 for existing in kept):
                 kept.append(candidate)
-        return sorted(kept, key=lambda item: (item.center[0], item.center[1]))
+
+        # Sau khi trung hòa chữ Level, card thật vẫn có điểm icon mạnh; các portrait
+        # Rogue/phòng bản đồ trong cùng hàng thường chỉ vừa chạm ngưỡng người dùng.
+        # Dùng một biên xác nhận nhỏ để không biến cấu trúc hàng thành false-positive.
+        strong_threshold = max(0.72, threshold + 0.03)
+        filtered = [
+            candidate
+            for candidate in kept
+            if candidate.score >= strong_threshold
+        ]
+        return sorted(filtered, key=lambda item: (item.center[0], item.center[1]))
 
 
 class BlueprintAssigner:
@@ -308,9 +374,21 @@ class BlueprintAssigner:
         )
         if self.inventory_blueprint_template is None:
             raise FileNotFoundError("Không đọc được assets/inventory_blueprint.png")
+        self.inventory_blueprint_planned_template = cv2.imread(
+            str(BUNDLE_DIR / "assets" / "inventory_blueprint_planned.png"),
+            cv2.IMREAD_GRAYSCALE,
+        )
+        if self.inventory_blueprint_planned_template is None:
+            raise FileNotFoundError("Không đọc được assets/inventory_blueprint_planned.png")
+        self.reveal_wing_eye_template = cv2.imread(
+            str(BUNDLE_DIR / "assets" / "reveal_wing_eye.png"),
+            cv2.IMREAD_GRAYSCALE,
+        )
+        if self.reveal_wing_eye_template is None:
+            raise FileNotFoundError("Không đọc được assets/reveal_wing_eye.png")
         self.threshold = DoubleVar(value=0.68)
-        self.plan_speed = DoubleVar(value=1.6)
-        self.speed_input = StringVar(value="1.6")
+        self.plan_speed = DoubleVar(value=0.8)
+        self.speed_input = StringVar(value="0.8")
         self.threshold_input = StringVar(value="0.68")
         self.zoom_steps_input = StringVar(value="3")
         self.debug_enabled = StringVar(value="0")
@@ -328,7 +406,9 @@ class BlueprintAssigner:
         self.window_targets: list[WindowTarget] = []
         self.process_choice = StringVar(value="")
         self.capture_origin = (0, 0)
-        self.active_speed = 1.6
+        self.capture_size = (1920, 1080)
+        self.last_capture: Image.Image | None = None
+        self.active_speed = 0.8
         self.active_threshold = 0.68
         self.active_zoom_steps = 3
         self.stop_event = threading.Event()
@@ -367,7 +447,10 @@ class BlueprintAssigner:
         ).pack(fill="x", pady=(8, 4))
         Label(
             self.planning_tab,
-            text="Mở Planning Table + Inventory, sau đó chạy batch. Tool chỉ Ctrl+click các ô được nhận dạng là Blueprint.",
+            text=(
+                "Mở Planning Table + Inventory, sau đó chạy batch. "
+                "Tool bỏ qua Blueprint đã plan có dấu đỏ."
+            ),
             justify=LEFT,
             anchor="w",
             fg="#444",
@@ -380,13 +463,40 @@ class BlueprintAssigner:
             font=("Segoe UI", 16, "bold"),
             anchor="w",
         ).pack(fill="x")
+        reveal_action_row = Frame(self.reveal_tab)
+        reveal_action_row.pack(fill="x", pady=(10, 8))
+        self.reveal_run_button = Button(
+            reveal_action_row,
+            text="Reveal Wings (F6)",
+            width=19,
+            command=self.start_reveal_run,
+        )
+        self.reveal_run_button.pack(side=LEFT, padx=(0, 6))
+        Button(
+            reveal_action_row,
+            text="Dừng (F8)",
+            width=11,
+            command=self.stop,
+        ).pack(side=LEFT)
         Label(
             self.reveal_tab,
-            text="Tab này đã được tách riêng để bổ sung quy trình Reveal Room ở bước phát triển tiếp theo.",
+            text=(
+                "Mở bàn Reveal + Inventory. Tool đọc Wings Revealed, bỏ qua Blueprint "
+                "đã đủ wing và mở lần lượt mắt lớn của các wing còn thiếu."
+            ),
             justify=LEFT,
             anchor="nw",
             fg="#555",
-        ).pack(fill="x", pady=(12, 0))
+            wraplength=560,
+        ).pack(fill="x")
+        self.reveal_summary = StringVar(value="Chưa chạy Reveal Room.")
+        Label(
+            self.reveal_tab,
+            textvariable=self.reveal_summary,
+            justify=LEFT,
+            anchor="nw",
+            wraplength=560,
+        ).pack(fill="x", pady=(10, 0))
 
         process_row = Frame(self.settings_tab)
         process_row.pack(fill="x", pady=(0, 8))
@@ -500,7 +610,7 @@ class BlueprintAssigner:
             data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
             return
-        speed = data.get("plan_speed", 1.6)
+        speed = data.get("plan_speed", 0.8)
         threshold = data.get("threshold", 0.68)
         zoom_steps = data.get("zoom_steps", 3)
         if isinstance(speed, (int, float)) and 0.5 <= float(speed) <= 5.0:
@@ -660,7 +770,10 @@ class BlueprintAssigner:
         self.capture_origin = (left, top)
         # all_screens=True cho phép bbox ở màn hình phụ/toạ độ âm, nhưng kết quả
         # vẫn chỉ là vùng client của process đã chọn.
-        return ImageGrab.grab(bbox=(left, top, right, bottom), all_screens=True).convert("RGB")
+        image = ImageGrab.grab(bbox=(left, top, right, bottom), all_screens=True).convert("RGB")
+        self.capture_size = image.size
+        self.last_capture = image
+        return image
 
     def start_run(self) -> None:
         if self.busy:
@@ -678,12 +791,28 @@ class BlueprintAssigner:
         self.active_zoom_steps = int(self.zoom_steps_input.get())
         threading.Thread(target=self._run_worker, daemon=True).start()
 
+    def start_reveal_run(self) -> None:
+        if self.busy:
+            return
+        if not self._apply_speed_input():
+            return
+        self.busy = True
+        self.stop_event.clear()
+        self.active_speed = round(float(self.plan_speed.get()), 1)
+        threading.Thread(target=self._reveal_worker, daemon=True).start()
+
+    def start_active_tab(self) -> None:
+        if self.notebook.index(self.notebook.select()) == 1:
+            self.start_reveal_run()
+        else:
+            self.start_run()
+
     @staticmethod
     def _click(x: int, y: int) -> None:
         ctypes.windll.user32.SetCursorPos(int(x), int(y))
-        time.sleep(0.025)
+        time.sleep(0.010)
         ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        time.sleep(0.025)
+        time.sleep(0.012)
         ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
     @staticmethod
@@ -702,10 +831,102 @@ class BlueprintAssigner:
         user32 = ctypes.windll.user32
         user32.keybd_event(VK_CONTROL, 0, 0, 0)
         try:
-            time.sleep(0.025)
+            time.sleep(0.015)
             cls._click(x, y)
         finally:
             user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+
+    @staticmethod
+    def _clear_clipboard() -> None:
+        user32 = ctypes.windll.user32
+        for _ in range(8):
+            if user32.OpenClipboard(None):
+                try:
+                    user32.EmptyClipboard()
+                finally:
+                    user32.CloseClipboard()
+                return
+            time.sleep(0.015)
+
+    @staticmethod
+    def _clipboard_text() -> str:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        user32.GetClipboardData.argtypes = [ctypes.c_uint]
+        user32.GetClipboardData.restype = ctypes.c_void_p
+        kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+        for _ in range(8):
+            if not user32.OpenClipboard(None):
+                time.sleep(0.015)
+                continue
+            try:
+                handle = user32.GetClipboardData(CF_UNICODETEXT)
+                if not handle:
+                    return ""
+                pointer = kernel32.GlobalLock(handle)
+                if not pointer:
+                    return ""
+                try:
+                    return ctypes.wstring_at(pointer)
+                finally:
+                    kernel32.GlobalUnlock(handle)
+            finally:
+                user32.CloseClipboard()
+        return ""
+
+    @classmethod
+    def _copy_hovered_item_text(cls, x: int, y: int, timeout: float = 0.65) -> str:
+        user32 = ctypes.windll.user32
+        user32.SetCursorPos(int(x), int(y))
+        # Tooltip item của game có thể giữ dữ liệu ô trước trong vài frame sau khi
+        # con trỏ đổi hàng. Chờ đủ lâu trước Ctrl+C để không đọc lặp Wings Revealed.
+        time.sleep(0.24)
+        cls._clear_clipboard()
+        user32.keybd_event(VK_CONTROL, 0, 0, 0)
+        user32.keybd_event(VK_C, 0, 0, 0)
+        time.sleep(0.018)
+        user32.keybd_event(VK_C, 0, KEYEVENTF_KEYUP, 0)
+        user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+        deadline = time.perf_counter() + timeout
+        while time.perf_counter() < deadline:
+            text = cls._clipboard_text()
+            if text:
+                return text
+            time.sleep(0.025)
+        return ""
+
+    @staticmethod
+    def _parse_wings_revealed(item_text: str) -> tuple[int, int] | None:
+        match = WINGS_REVEALED_PATTERN.search(item_text)
+        if match is None:
+            return None
+        current, total = int(match.group(1)), int(match.group(2))
+        if total not in (3, 4) or not 0 <= current <= total:
+            return None
+        return current, total
+
+    def _read_inventory_wings_reliably(
+        self,
+        screen_x: int,
+        screen_y: int,
+    ) -> tuple[int, int] | None:
+        """Hai lần đọc độc lập phải trùng nhau để loại tooltip còn sót từ ô trước."""
+        for _attempt in range(3):
+            self._move_cursor_clear_of_reveal_wings()
+            time.sleep(0.09)
+            first = self._parse_wings_revealed(
+                self._copy_hovered_item_text(screen_x, screen_y)
+            )
+            self._move_cursor_clear_of_reveal_wings()
+            time.sleep(0.09)
+            second = self._parse_wings_revealed(
+                self._copy_hovered_item_text(screen_x, screen_y)
+            )
+            if first is not None and first == second:
+                return first
+        return None
 
     @staticmethod
     def _popup_panel_visible(image: Image.Image) -> bool:
@@ -765,11 +986,17 @@ class BlueprintAssigner:
         """Tìm tâm portrait Rogue đầu tiên bên trái khi template số 5 không ổn định."""
         gray = cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2GRAY)
         height, width = gray.shape
-        edges = cv2.Canny(gray, 40, 120)
+        # Card Rogue chỉ nằm trong popup giữa màn hình. Cắt ROI trước Canny giúp
+        # vòng polling đóng popup nhanh hơn nhiều, nhất là client 1920×1080.
+        roi_x0, roi_x1 = int(width * 0.36), int(width * 0.66)
+        roi_y0, roi_y1 = int(height * 0.30), int(height * 0.70)
+        edges = cv2.Canny(gray[roi_y0:roi_y1, roi_x0:roi_x1], 40, 120)
         contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         cards: list[tuple[int, int, int, int]] = []
         for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
+            x += roi_x0
+            y += roi_y0
             if (
                 width * 0.36 < x < width * 0.66
                 and height * 0.32 < y < height * 0.50
@@ -835,11 +1062,10 @@ class BlueprintAssigner:
         popup_seen = False
         while time.perf_counter() < deadline and not self.stop_event.is_set():
             image = self.capture()
-            popup_seen = popup_seen or self._popup_present(image)
             target = self._rogue_choice_target(image)
             if target is not None:
                 return target, True
-            time.sleep(0.035)
+            time.sleep(0.018)
         return None, popup_seen
 
     def _wait_for_popup_closed(self, timeout: float) -> bool:
@@ -852,7 +1078,7 @@ class BlueprintAssigner:
                 consecutive_closed += 1
                 if consecutive_closed >= 3:
                     return True
-            time.sleep(0.04)
+            time.sleep(0.020)
         return False
 
     def _select_open_rogue_popup(
@@ -874,8 +1100,7 @@ class BlueprintAssigner:
                         return True, last_target, attempts
                     continue
             rogue_x, rogue_y, score, method = target
-            image = self.capture()
-            adjusted_y = rogue_y + round(image.height * y_offsets[attempts])
+            adjusted_y = rogue_y + round(self.capture_size[1] * y_offsets[attempts])
             origin_x, origin_y = self.capture_origin
             self._click(rogue_x + origin_x, adjusted_y + origin_y)
             attempts += 1
@@ -936,10 +1161,14 @@ class BlueprintAssigner:
             time.sleep(0.035)
         return None, None
 
-    def _find_ready_confirm_plans(self, image: Image.Image) -> tuple[int, int, float] | None:
+    def _find_ready_confirm_plans(
+        self,
+        image: Image.Image,
+        popup_already_closed: bool = False,
+    ) -> tuple[int, int, float] | None:
         """Chỉ nhận nút Confirm đang sáng, không dùng thay detector Planning Table."""
         # Không bao giờ chuyển sang Confirm khi popup chọn Rogue còn che bản đồ.
-        if self._popup_present(image):
+        if not popup_already_closed and self._popup_present(image):
             return None
         rgb = np.asarray(image.convert("RGB"))
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
@@ -1001,21 +1230,42 @@ class BlueprintAssigner:
     def _inventory_slot_point(width: int, height: int, index: int) -> tuple[int, int]:
         row, column = divmod(index, 12)
         # Grid inventory có kích thước theo chiều cao UI và neo vào cạnh phải.
-        # Công thức này giữ đúng cả client 1920×1080 lẫn 800×600.
+        # Công thức neo theo chiều cao + cạnh phải giữ đúng ở 1920×1080,
+        # 1768×992 và cả cửa sổ 16:10 1680×1050.
         cell_size = height * 0.0490
         right_margin = height * 0.0367
         x = width - right_margin - (11 - column) * cell_size
         y = height * (0.543 + (row + 0.5) * 0.0490)
         return round(x), round(y)
 
-    def _detect_inventory_blueprints(self, image: Image.Image) -> list[tuple[int, float]]:
-        """Quét lưới 12×5 và trả về (slot index, confidence) của Blueprint."""
+    def _planned_blueprint_score(self, cell: np.ndarray, base_scale: float) -> float:
+        """Đo con dấu đỏ trên Blueprint đã plan trong một ô inventory."""
+        best_score = -1.0
+        for scale in base_scale * np.linspace(0.85, 1.15, 9):
+            template = cv2.resize(
+                self.inventory_blueprint_planned_template,
+                None,
+                fx=float(scale),
+                fy=float(scale),
+                interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC,
+            )
+            if template.shape[0] > cell.shape[0] or template.shape[1] > cell.shape[1]:
+                continue
+            result = cv2.matchTemplate(cell, template, cv2.TM_CCOEFF_NORMED)
+            best_score = max(best_score, float(cv2.minMaxLoc(result)[1]))
+        return best_score
+
+    def _detect_inventory_blueprints(
+        self,
+        image: Image.Image,
+    ) -> list[InventoryBlueprintDetection]:
+        """Quét lưới 12×5, nhận dạng Blueprint và trạng thái đã/chưa plan."""
         gray = cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2GRAY)
         height, width = gray.shape
         half_cell_width = round(height * 0.0245)
         half_cell_height = round(height * 0.0245)
         base_scale = height / 1080.0
-        matches: list[tuple[int, float]] = []
+        matches: list[InventoryBlueprintDetection] = []
 
         for index in range(60):
             center_x, center_y = self._inventory_slot_point(width, height, index)
@@ -1037,8 +1287,339 @@ class BlueprintAssigner:
                 result = cv2.matchTemplate(cell, template, cv2.TM_CCOEFF_NORMED)
                 best_score = max(best_score, float(cv2.minMaxLoc(result)[1]))
             if best_score >= 0.62:
-                matches.append((index, best_score))
+                matches.append(
+                    InventoryBlueprintDetection(
+                        slot_index=index,
+                        blueprint_score=best_score,
+                        planned_score=self._planned_blueprint_score(cell, base_scale),
+                    )
+                )
         return matches
+
+    def _find_reveal_wing_eyes(
+        self,
+        image: Image.Image,
+    ) -> list[tuple[int, int, float]]:
+        """Tìm mắt xám giữa các khung wing đỏ; dùng NMS để gộp nhiều mức scale."""
+        rgb = np.asarray(image.convert("RGB"))
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        height, width = gray.shape
+        x0, x1 = int(width * 0.28), int(width * 0.91)
+        y0, y1 = int(height * 0.28), int(height * 0.72)
+        roi = gray[y0:y1, x0:x1]
+        base_scale = height / 1080.0
+        candidates: list[tuple[int, int, float]] = []
+
+        for scale in base_scale * np.linspace(0.80, 1.20, 11):
+            template = cv2.resize(
+                self.reveal_wing_eye_template,
+                None,
+                fx=float(scale),
+                fy=float(scale),
+                interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC,
+            )
+            template_height, template_width = template.shape
+            if template_height >= roi.shape[0] or template_width >= roi.shape[1]:
+                continue
+            result = cv2.matchTemplate(roi, template, cv2.TM_CCOEFF_NORMED)
+            local_maximum = cv2.dilate(result, np.ones((9, 9), np.uint8))
+            peak_y, peak_x = np.where((result >= 0.50) & (result >= local_maximum - 1e-6))
+            for match_y, match_x in zip(peak_y.tolist(), peak_x.tolist()):
+                center_x = x0 + match_x + template_width // 2
+                center_y = y0 + match_y + template_height // 2
+                patch = rgb[
+                    max(0, center_y - round(height * 0.037)):
+                    min(height, center_y + round(height * 0.037)),
+                    max(0, center_x - round(height * 0.050)):
+                    min(width, center_x + round(height * 0.050)),
+                ]
+                if patch.size == 0:
+                    continue
+                red, green, blue = np.mean(patch, axis=(0, 1))
+                # Mắt thật nằm trên nền wing đỏ. Mắt trang trí trên tooltip giấy có
+                # hình gần giống nhưng nền ít đỏ hơn nên bị loại ở đây.
+                if red - green < 21 or red - blue < 28:
+                    continue
+                candidates.append((center_x, center_y, float(result[match_y, match_x])))
+
+        kept: list[tuple[int, int, float]] = []
+        for candidate in sorted(candidates, key=lambda item: item[2], reverse=True):
+            x, y, _score = candidate
+            if all(
+                ((x - old_x) / (width * 0.065)) ** 2
+                + ((y - old_y) / (height * 0.075)) ** 2
+                > 1.0
+                for old_x, old_y, _old_score in kept
+            ):
+                kept.append(candidate)
+        return sorted(kept, key=lambda item: item[0])
+
+    @staticmethod
+    def _has_unrevealed_wing_panel(image: Image.Image) -> bool:
+        """Nhận khối wing đỏ lớn, không phụ thuộc mắt đang ở pha sáng hay tối."""
+        rgb = np.asarray(image.convert("RGB"))
+        height, width = rgb.shape[:2]
+        red = rgb[:, :, 0].astype(np.int16)
+        green = rgb[:, :, 1].astype(np.int16)
+        blue = rgb[:, :, 2].astype(np.int16)
+        mask = (
+            (red > 65)
+            & (red - green > 26)
+            & (red - blue > 33)
+        ).astype(np.uint8) * 255
+        mask[:int(height * 0.25), :] = 0
+        mask[int(height * 0.75):, :] = 0
+        mask[:, :int(width * 0.25)] = 0
+        mask[:, int(width * 0.92):] = 0
+        kernel_size = max(9, round(height * 0.014))
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(
+                cv2.MORPH_RECT,
+                (kernel_size, kernel_size),
+            ),
+        )
+        component_count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            mask,
+            8,
+        )
+        for index in range(1, component_count):
+            _x, _y, component_width, component_height, area = map(int, stats[index])
+            fill_ratio = area / max(1, component_width * component_height)
+            if (
+                component_width > width * 0.12
+                and component_height > height * 0.16
+                and fill_ratio > 0.18
+            ):
+                return True
+        return False
+
+    def _move_cursor_clear_of_reveal_wings(self) -> None:
+        origin_x, origin_y = self.capture_origin
+        width, height = self.capture_size
+        ctypes.windll.user32.SetCursorPos(
+            origin_x + round(width * 0.50),
+            origin_y + round(height * 0.91),
+        )
+
+    def _wait_for_reveal_eyes(
+        self,
+        expected_count: int,
+        timeout: float,
+    ) -> list[tuple[int, int, float]]:
+        """Lấy nhiều frame vì mắt và khung wing thay đổi độ sáng liên tục."""
+        deadline = time.perf_counter() + timeout
+        accumulated: list[tuple[int, int, float]] = []
+        while time.perf_counter() < deadline and not self.stop_event.is_set():
+            eyes = self._find_reveal_wing_eyes(self.capture())
+            width, height = self.capture_size
+            for eye in eyes:
+                x, y, score = eye
+                existing_index = next(
+                    (
+                        index
+                        for index, (old_x, old_y, _old_score) in enumerate(accumulated)
+                        if ((x - old_x) / (width * 0.060)) ** 2
+                        + ((y - old_y) / (height * 0.070)) ** 2
+                        <= 1.0
+                    ),
+                    None,
+                )
+                if existing_index is None:
+                    accumulated.append(eye)
+                elif score > accumulated[existing_index][2]:
+                    accumulated[existing_index] = eye
+            if len(accumulated) >= expected_count:
+                return sorted(accumulated, key=lambda item: item[0])
+            time.sleep(0.055)
+        return sorted(accumulated, key=lambda item: item[0])
+
+    def _observe_reveal_state(self, duration: float = 0.90) -> tuple[bool, bool]:
+        """Quan sát đủ một chu kỳ nhấp nháy; trả về (có panel đỏ, có mắt wing)."""
+        deadline = time.perf_counter() + duration
+        panel_seen = False
+        eye_seen = False
+        while time.perf_counter() < deadline and not self.stop_event.is_set():
+            frame = self.capture()
+            panel_seen = panel_seen or self._has_unrevealed_wing_panel(frame)
+            eye_seen = eye_seen or bool(self._find_reveal_wing_eyes(frame))
+            if panel_seen and eye_seen:
+                break
+            time.sleep(0.065)
+        return panel_seen, eye_seen
+
+    def _extract_revealed_blueprint(self) -> None:
+        image = self.capture()
+        origin_x, origin_y = self.capture_origin
+        self._ctrl_click(
+            origin_x + round(image.width * 0.50),
+            origin_y + round(image.height * 0.865),
+        )
+        time.sleep(max(0.35, min(0.70, self.active_speed * 0.35)))
+
+    def _reveal_one_blueprint(
+        self,
+        blueprint_number: int,
+        slot_index: int,
+        current_wings: int,
+        total_wings: int,
+    ) -> dict:
+        missing = total_wings - current_wings
+        image = self.capture()
+        slot_x, slot_y = self._inventory_slot_point(image.width, image.height, slot_index)
+        origin_x, origin_y = self.capture_origin
+        self._worker_status(
+            f"Reveal {blueprint_number}: ô {slot_index + 1} · "
+            f"Wings Revealed {current_wings}/{total_wings}"
+        )
+        self._ctrl_click(origin_x + slot_x, origin_y + slot_y)
+        time.sleep(0.18)
+        self.capture()
+        self._move_cursor_clear_of_reveal_wings()
+
+        revealed = 0
+        errors: list[str] = []
+        screen_complete = False
+        # Blueprint tối đa có bốn wing và luôn có ít nhất một wing ban đầu.
+        # Không dùng số đọc từ clipboard làm số click tuyệt đối: UI mới là nguồn
+        # xác nhận cuối cùng, tránh một tooltip cũ khiến 2/3 bị đọc nhầm thành 1/3.
+        for wing_number in range(3):
+            self._worker_status(
+                f"Reveal {blueprint_number}: tìm mắt wing "
+                f"{wing_number + 1} · item báo {current_wings}/{total_wings}"
+            )
+            eyes = self._wait_for_reveal_eyes(1, timeout=2.8)
+            if not eyes:
+                panel_seen, eye_seen = self._observe_reveal_state()
+                screen_complete = not panel_seen and not eye_seen
+                if not screen_complete:
+                    errors.append(
+                        "Còn khung wing đỏ nhưng không khóa được mắt lớn qua nhiều frame."
+                    )
+                break
+            eye_x, eye_y, eye_score = eyes[0]
+            origin_x, origin_y = self.capture_origin
+            self._click(origin_x + eye_x, origin_y + eye_y)
+            revealed += 1
+            self._move_cursor_clear_of_reveal_wings()
+            animation_deadline = time.perf_counter() + 3.0
+            while (
+                time.perf_counter() < animation_deadline
+                and not self.stop_event.is_set()
+            ):
+                time.sleep(0.05)
+            if self.stop_event.is_set():
+                errors.append("Đã dừng trong lúc chờ hiệu ứng reveal.")
+                break
+            panel_seen, eye_seen = self._observe_reveal_state()
+            if not panel_seen and not eye_seen:
+                screen_complete = True
+                break
+
+        if not self.stop_event.is_set() and not screen_complete:
+            self._move_cursor_clear_of_reveal_wings()
+            remaining_eyes = self._wait_for_reveal_eyes(1, timeout=2.2)
+            panel_seen, eye_seen = self._observe_reveal_state()
+            screen_complete = not remaining_eyes and not panel_seen and not eye_seen
+            if not screen_complete and not errors:
+                errors.append("Sau ba lần reveal vẫn còn wing chưa mở.")
+
+        self._extract_revealed_blueprint()
+        return {
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "blueprint": blueprint_number,
+            "inventory_slot": slot_index + 1,
+            "wings_before": current_wings,
+            "wings_total": total_wings,
+            "wings_requested": missing,
+            "wings_revealed": revealed,
+            "success": screen_complete and not errors,
+            "errors": errors,
+        }
+
+    def _reveal_worker(self) -> None:
+        actions: list[dict] = []
+        message = ""
+        try:
+            self._focus_selected_game()
+            time.sleep(0.20)
+            inventory_image = self.capture()
+            detected = self._detect_inventory_blueprints(inventory_image)
+            origin_x, origin_y = self.capture_origin
+            queue: list[tuple[int, int, int]] = []
+            unreadable: list[int] = []
+            complete: list[int] = []
+
+            for detection in detected:
+                if self.stop_event.is_set():
+                    break
+                slot_x, slot_y = self._inventory_slot_point(
+                    inventory_image.width,
+                    inventory_image.height,
+                    detection.slot_index,
+                )
+                wings = self._read_inventory_wings_reliably(
+                    origin_x + slot_x,
+                    origin_y + slot_y,
+                )
+                if wings is None:
+                    unreadable.append(detection.slot_index + 1)
+                    continue
+                current, total = wings
+                if current >= total:
+                    complete.append(detection.slot_index + 1)
+                else:
+                    queue.append((detection.slot_index, current, total))
+
+            self._move_cursor_clear_of_reveal_wings()
+            self._worker_status(
+                f"Reveal Room: {len(queue)} cần mở · {len(complete)} đã đủ wing · "
+                f"{len(unreadable)} không đọc được."
+            )
+
+            for index, (slot_index, current, total) in enumerate(queue, 1):
+                if self.stop_event.is_set():
+                    message = f"Đã dừng bằng {self.stop_hotkey_name}."
+                    break
+                actions.append(
+                    self._reveal_one_blueprint(
+                        index,
+                        slot_index,
+                        current,
+                        total,
+                    )
+                )
+            else:
+                successful = sum(bool(item["success"]) for item in actions)
+                message = (
+                    f"Reveal Room: hoàn thành {successful}/{len(queue)} Blueprint; "
+                    f"bỏ qua {len(complete)} đã đủ wing"
+                )
+                if unreadable:
+                    message += (
+                        "; không đọc được Wings Revealed tại ô "
+                        + ", ".join(map(str, unreadable))
+                    )
+                message += "."
+        except Exception as error:
+            message = f"Lỗi Reveal Room: {error}"
+        finally:
+            self._write_reveal_log(actions, message)
+            self.root.after(0, lambda: self._finish_reveal_run(message, actions))
+
+    @staticmethod
+    def _write_reveal_log(actions: list[dict], message: str) -> None:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        path = LOG_DIR / f"reveal-run-{datetime.now():%Y%m%d-%H%M%S}.json"
+        path.write_text(
+            json.dumps(
+                {"result": message, "actions": actions},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
     @staticmethod
     def _planning_zoom_centers(width: int, height: int) -> list[tuple[int, int]]:
@@ -1147,13 +1728,24 @@ class BlueprintAssigner:
                 "Popup Rogue vẫn còn mở sau các lần retry; không click thẻ khác để tránh lệch."
             )
 
+        if rogue_selected and self.last_capture is not None:
+            # _wait_for_popup_closed đã chụp được frame đóng ổn định; dùng lại
+            # frame này thay vì chụp thêm sau khi đã hết ngân sách tốc độ.
+            final_image = self.last_capture
+            popup_clear = True
+        else:
+            final_image = self.capture()
+            popup_clear = not self._popup_present(final_image)
+        confirm_ready = (
+            self._find_ready_confirm_plans(final_image, popup_already_closed=True)
+            if popup_clear
+            else None
+        )
         elapsed = time.perf_counter() - item_started
         if elapsed < self.active_speed:
             time.sleep(self.active_speed - elapsed)
+        action["target_duration_seconds"] = round(self.active_speed, 1)
         action["duration_seconds"] = round(time.perf_counter() - item_started, 3)
-        final_image = self.capture()
-        popup_clear = not self._popup_present(final_image)
-        confirm_ready = self._find_ready_confirm_plans(final_image) if popup_clear else None
         return action, popup_clear, confirm_ready
 
     def _plan_current_blueprint(self, blueprint_number: int) -> list[dict]:
@@ -1309,19 +1901,32 @@ class BlueprintAssigner:
 
             # Planning Table + Inventory: quét một lần và chỉ giữ ô Blueprint.
             inventory_image = self.capture()
-            blueprint_slots = self._detect_inventory_blueprints(inventory_image)
-            if blueprint_slots:
-                slot_list = ", ".join(str(index + 1) for index, _score in blueprint_slots)
+            detected_blueprints = self._detect_inventory_blueprints(inventory_image)
+            blueprint_slots = [
+                detection for detection in detected_blueprints if not detection.is_planned
+            ]
+            planned_slots = [
+                detection for detection in detected_blueprints if detection.is_planned
+            ]
+            if detected_blueprints:
+                pending_list = ", ".join(
+                    str(detection.slot_index + 1) for detection in blueprint_slots
+                ) or "không có"
+                planned_list = ", ".join(
+                    str(detection.slot_index + 1) for detection in planned_slots
+                ) or "không có"
                 self._worker_status(
-                    f"Tìm thấy {len(blueprint_slots)} Blueprint tại ô: {slot_list}"
+                    f"Blueprint chưa plan: {pending_list} · đã plan, bỏ qua: {planned_list}"
                 )
             else:
                 self._worker_status("Không tìm thấy Blueprint trong inventory 12×5.")
 
-            for batch_index, (slot_index, inventory_score) in enumerate(blueprint_slots, 1):
+            for batch_index, inventory_detection in enumerate(blueprint_slots, 1):
                 if self.stop_event.is_set():
                     message = f"Đã dừng bằng {self.stop_hotkey_name}."
                     break
+                slot_index = inventory_detection.slot_index
+                inventory_score = inventory_detection.blueprint_score
                 image = self.capture()
                 slot_x, slot_y = self._inventory_slot_point(image.width, image.height, slot_index)
                 origin_x, origin_y = self.capture_origin
@@ -1343,7 +1948,8 @@ class BlueprintAssigner:
                 time.sleep(max(0.15, min(0.45, self.active_speed * 0.15)))
             else:
                 message = (
-                    f"Quét 60 ô, tìm thấy {len(blueprint_slots)} và đã xử lý "
+                    f"Quét 60 ô: {len(blueprint_slots)} Blueprint chưa plan, "
+                    f"bỏ qua {len(planned_slots)} đã plan và đã xử lý "
                     f"{blueprint_count} Blueprint."
                 )
 
@@ -1369,6 +1975,22 @@ class BlueprintAssigner:
         details = "\n".join(f"{i}. {item['equipment']} ({item['score']:.1%})" for i, item in enumerate(actions, 1))
         self.summary.set(f"{message}\n\nĐã xử lý {len(actions)} mục." + (f"\n\n{details}" if details else ""))
 
+    def _finish_reveal_run(self, message: str, actions: list[dict]) -> None:
+        self.busy = False
+        self.root.deiconify()
+        self.root.lift()
+        self.status.set(message)
+        details = "\n".join(
+            f"{index}. Ô {item['inventory_slot']}: "
+            f"{item['wings_before']}/{item['wings_total']} → "
+            f"+{item['wings_revealed']} wing"
+            + ("" if item["success"] else " (chưa hoàn tất)")
+            for index, item in enumerate(actions, 1)
+        )
+        self.reveal_summary.set(
+            message + (f"\n\n{details}" if details else "")
+        )
+
     def stop(self) -> None:
         self.stop_event.set()
         self.status.set("Đã gửi lệnh dừng; tool sẽ dừng trước click kế tiếp.")
@@ -1376,7 +1998,7 @@ class BlueprintAssigner:
     def _hotkey_loop(self) -> None:
         while True:
             hotkeys = (
-                (self.run_hotkey_code, self.start_run),
+                (self.run_hotkey_code, self.start_active_tab),
                 (self.stop_hotkey_code, self.stop),
             )
             for key, callback in hotkeys:
